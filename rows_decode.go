@@ -34,7 +34,7 @@ func (rows *mysqlRows) readRowPacket(binary bool) ([]byte, error) {
 		return nil, err
 	}
 	if len(data) == 0 {
-		return nil, ErrMalformPkt
+		return nil, mc.desync(ErrMalformPkt)
 	}
 	if data[0] == iEOF && (binary || len(data) <= 0xffffff) {
 		statusPos := 3
@@ -43,7 +43,7 @@ func (rows *mysqlRows) readRowPacket(binary bool) ([]byte, error) {
 			statusPos = 1
 			for range 2 {
 				if statusPos >= len(data) {
-					return nil, ErrMalformPkt
+					return nil, mc.desync(ErrMalformPkt)
 				}
 				n := 1
 				switch data[statusPos] {
@@ -58,7 +58,7 @@ func (rows *mysqlRows) readRowPacket(binary bool) ([]byte, error) {
 			}
 		}
 		if len(data) < statusPos+2 {
-			return nil, ErrMalformPkt
+			return nil, mc.desync(ErrMalformPkt)
 		}
 		mc.status = readStatus(data[statusPos:])
 		rows.rs.done = true

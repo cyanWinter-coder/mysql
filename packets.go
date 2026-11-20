@@ -27,6 +27,34 @@ import (
 // https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html
 // https://mariadb.com/kb/en/clientserver-protocol/
 
+// desync closes the connection and returns err (ErrMalformPkt if nil).
+//
+// It must be used whenever the response stream can no longer be trusted:
+// a malformed packet, or a failed length or sequence validation. A
+// connection in an unknown protocol state must never be reused, because
+// unconsumed or misaligned packets would leak into the next command issued
+// through the connection pool. Closing the connection makes IsValid and
+// ResetSession report it as bad, so database/sql discards it.
+//
+// Do NOT use this for server SQL errors delivered in a complete ERR packet:
+// the ERR packet terminates the response, the stream stays aligned, and the
+// connection remains reusable.
+func (mc *mysqlConn) desync(err error) error {
+	if err == nil {
+		err = ErrMalformPkt
+	}
+	mc.log(err)
+	mc.close()
+	return err
+}
+
+// readLengthEncodedIntegerSafe is readLengthEncodedIntegerChecked without
+// the NULL flag, for packet fields that are never NULL.
+func readLengthEncodedIntegerSafe(b []byte) (num uint64, n int, ok bool) {
+	num, _, n, ok = readLengthEncodedIntegerChecked(b)
+	return num, n, ok
+}
+
 // read n bytes from mc.buf
 func (mc *mysqlConn) readNext(n int) ([]byte, error) {
 	if mc.buf.len() < n {
@@ -559,10 +587,18 @@ func (mc *okHandler) readResultSetHeaderPacket() (int, bool, error) {
 	// column count
 	// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html
 	// https://mariadb.com/kb/en/result-set-packets/#column-count-packet
-	num, _, len := readLengthEncodedInteger(data)
+	num, n, ok := readLengthEncodedIntegerSafe(data)
+	if !ok {
+		return 0, false, mc.conn().desync(ErrMalformPkt)
+	}
 
 	if mc.extCapabilities&clientCacheMetadata != 0 {
-		return int(num), data[len] == 0x01, nil
+		if n >= len(data) {
+			// The metadata-follows flag is mandatory in this packet when
+			// clientCacheMetadata was negotiated.
+			return 0, false, mc.conn().desync(ErrMalformPkt)
+		}
+		return int(num), data[n] == 0x01, nil
 	}
 	// ignore remaining data in the packet. see #1478.
 	return int(num), true, nil
@@ -573,7 +609,9 @@ func (mc *okHandler) readResultSetHeaderPacket() (int, bool, error) {
 func (mc *mysqlConn) handleErrorPacket(data []byte) error {
 	me, err := decodeErrorPacket(data)
 	if err != nil {
-		return err
+		// A malformed ERR packet means the framing can no longer be
+		// trusted; the connection must not be reused.
+		return mc.desync(err)
 	}
 	errno := me.Number
 
@@ -656,16 +694,22 @@ func (mc *mysqlConn) clearResult() *okHandler {
 // Ok Packet
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_ok_packet.html
 func (mc *okHandler) handleOkPacket(data []byte) error {
-	var n, m int
-	var affectedRows, insertId uint64
-
 	// 0x00 [1 byte]
+	pos := 1
 
 	// Affected rows [Length Coded Binary]
-	affectedRows, _, n = readLengthEncodedInteger(data[1:])
+	affectedRows, n, ok := readLengthEncodedIntegerSafe(data[pos:])
+	if !ok {
+		return mc.conn().desync(ErrMalformPkt)
+	}
+	pos += n
 
 	// Insert id [Length Coded Binary]
-	insertId, _, m = readLengthEncodedInteger(data[1+n:])
+	insertId, n, ok := readLengthEncodedIntegerSafe(data[pos:])
+	if !ok {
+		return mc.conn().desync(ErrMalformPkt)
+	}
+	pos += n
 
 	// Update for the current statement result (only used by
 	// readResultSetHeaderPacket).
@@ -677,7 +721,10 @@ func (mc *okHandler) handleOkPacket(data []byte) error {
 	}
 
 	// server_status [2 bytes]
-	mc.status = readStatus(data[1+n+m : 1+n+m+2])
+	if len(data) < pos+2 {
+		return mc.conn().desync(ErrMalformPkt)
+	}
+	mc.status = readStatus(data[pos : pos+2])
 	if mc.status&statusMoreResultsExists != 0 {
 		return nil
 	}
@@ -704,13 +751,13 @@ func (mc *mysqlConn) readColumns(count int, old []mysqlField) ([]mysqlField, err
 		// Catalog
 		pos, err := skipLengthEncodedString(data)
 		if err != nil {
-			return nil, err
+			return nil, mc.desync(err)
 		}
 
 		// Database [len coded string]
 		n, err := skipLengthEncodedString(data[pos:])
 		if err != nil {
-			return nil, err
+			return nil, mc.desync(err)
 		}
 		pos += n
 
@@ -718,7 +765,7 @@ func (mc *mysqlConn) readColumns(count int, old []mysqlField) ([]mysqlField, err
 		if mc.cfg.ColumnsWithAlias {
 			tableName, _, n, err := readLengthEncodedString(data[pos:])
 			if err != nil {
-				return nil, err
+				return nil, mc.desync(err)
 			}
 			pos += n
 			if old != nil && old[i].tableName == string(tableName) {
@@ -730,7 +777,7 @@ func (mc *mysqlConn) readColumns(count int, old []mysqlField) ([]mysqlField, err
 		} else {
 			n, err = skipLengthEncodedString(data[pos:])
 			if err != nil {
-				return nil, err
+				return nil, mc.desync(err)
 			}
 			pos += n
 		}
@@ -738,14 +785,14 @@ func (mc *mysqlConn) readColumns(count int, old []mysqlField) ([]mysqlField, err
 		// Original table [len coded string]
 		n, err = skipLengthEncodedString(data[pos:])
 		if err != nil {
-			return nil, err
+			return nil, mc.desync(err)
 		}
 		pos += n
 
 		// Name [len coded string]
 		name, _, n, err := readLengthEncodedString(data[pos:])
 		if err != nil {
-			return nil, err
+			return nil, mc.desync(err)
 		}
 		if old != nil && old[i].name == string(name) {
 			// avoid allocating new string
@@ -758,9 +805,19 @@ func (mc *mysqlConn) readColumns(count int, old []mysqlField) ([]mysqlField, err
 		// Original name [len coded string]
 		n, err = skipLengthEncodedString(data[pos:])
 		if err != nil {
-			return nil, err
+			return nil, mc.desync(err)
 		}
 		pos += n
+
+		// Filler [uint8]
+		// Charset (collation ID) [uint16]
+		// Length [uint32]
+		// Field type [uint8]
+		// Flags [uint16]
+		// Decimals [uint8]
+		if len(data) < pos+1+2+4+1+2+1 {
+			return nil, mc.desync(ErrMalformPkt)
+		}
 
 		// Filler [uint8]
 		pos++
@@ -806,7 +863,7 @@ func (rows *textRows) readRow(dest []driver.Value) error {
 			n = uint(data[0]) + 1
 			buf, data = data[1:n:n], data[n:]
 		} else if buf, data, err = readColumnBytes(data); err != nil {
-			return err
+			return rows.mc.desync(err)
 		}
 		if buf == nil {
 			dest[i] = nil
@@ -858,7 +915,7 @@ func (rows *textRows) readRow(dest []driver.Value) error {
 	}
 
 	if len(data) != 0 {
-		return ErrMalformPkt
+		return rows.mc.desync(ErrMalformPkt)
 	}
 	return nil
 }
@@ -905,12 +962,24 @@ func (mc *mysqlConn) skipRows() error {
 			// In such case, 0xFE can mean string larger than 0xffffff.
 			if len(data) <= 0xffffff {
 				if mc.capabilities&clientDeprecateEOF == 0 {
-					// EOF packet
+					// EOF packet: 0xfe, warnings [2 bytes], status [2 bytes]
+					if len(data) < 5 {
+						return mc.desync(ErrMalformPkt)
+					}
 					mc.status = readStatus(data[3:])
 				} else {
 					// OK packet with an 0xFE header
-					_, _, n := readLengthEncodedInteger(data[1:])   // affected_rows
-					_, _, m := readLengthEncodedInteger(data[1+n:]) // last_insert_id
+					_, n, ok := readLengthEncodedIntegerSafe(data[1:]) // affected_rows
+					if !ok {
+						return mc.desync(ErrMalformPkt)
+					}
+					_, m, ok := readLengthEncodedIntegerSafe(data[1+n:]) // last_insert_id
+					if !ok {
+						return mc.desync(ErrMalformPkt)
+					}
+					if len(data) < 1+n+m+2 {
+						return mc.desync(ErrMalformPkt)
+					}
 					mc.status = readStatus(data[1+n+m:])
 				}
 				return nil
@@ -931,6 +1000,15 @@ func (stmt *mysqlStmt) readPrepareResultPacket() (uint16, error) {
 		// packet indicator [1 byte]
 		if data[0] != iOK {
 			return 0, stmt.mc.handleErrorPacket(data)
+		}
+
+		// statement id [4 bytes]
+		// column count [2 bytes]
+		// param count [2 bytes]
+		// reserved [1 byte]
+		// warning count [2 bytes]
+		if len(data) < 12 {
+			return 0, stmt.mc.desync(ErrMalformPkt)
 		}
 
 		// statement id [4 bytes]
@@ -1258,7 +1336,7 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 	}
 	reader, err := newBinaryRowReader(data, len(rows.rs.columns))
 	if err != nil {
-		return err
+		return rows.mc.desync(err)
 	}
 	for i := range dest {
 		col := &rows.rs.columns[i]
@@ -1273,7 +1351,7 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 		if !fixed {
 			raw, err = reader.readVariableColumn(col.fieldType)
 			if err != nil {
-				return err
+				return rows.mc.desync(err)
 			}
 		}
 		if raw == nil {
@@ -1327,7 +1405,7 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 		}
 	}
 	if len(reader.data) != 0 {
-		return ErrMalformPkt
+		return rows.mc.desync(ErrMalformPkt)
 	}
 	return nil
 }

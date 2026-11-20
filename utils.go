@@ -529,7 +529,10 @@ func uint64ToString(n uint64) []byte {
 // the input slice
 func readLengthEncodedString(b []byte) ([]byte, bool, int, error) {
 	// Get length
-	num, isNull, n := readLengthEncodedInteger(b)
+	num, isNull, n, ok := readLengthEncodedIntegerChecked(b)
+	if !ok {
+		return nil, false, 0, io.EOF
+	}
 	if num < 1 {
 		return b[n:n], isNull, n, nil
 	}
@@ -547,7 +550,10 @@ func readLengthEncodedString(b []byte) ([]byte, bool, int, error) {
 // longer than the input slice
 func skipLengthEncodedString(b []byte) (int, error) {
 	// Get length
-	num, _, n := readLengthEncodedInteger(b)
+	num, _, n, ok := readLengthEncodedIntegerChecked(b)
+	if !ok {
+		return 0, io.EOF
+	}
 	if num < 1 {
 		return n, nil
 	}
@@ -588,6 +594,30 @@ func readLengthEncodedInteger(b []byte) (uint64, bool, int) {
 
 	// 0-250: value of first byte
 	return uint64(b[0]), false, 1
+}
+
+// readLengthEncodedIntegerChecked is a bounds-checked variant of
+// readLengthEncodedInteger for parsing server packets, where a truncated
+// multi-byte length prefix must be reported (ok == false) instead of
+// panicking.
+func readLengthEncodedIntegerChecked(b []byte) (num uint64, isNull bool, n int, ok bool) {
+	if len(b) == 0 {
+		return 0, false, 0, false
+	}
+	need := 1
+	switch b[0] {
+	case 0xfc:
+		need = 3
+	case 0xfd:
+		need = 4
+	case 0xfe:
+		need = 9
+	}
+	if len(b) < need {
+		return 0, false, 0, false
+	}
+	num, isNull, n = readLengthEncodedInteger(b)
+	return num, isNull, n, true
 }
 
 // encodes a uint64 value and appends it to the given bytes slice
