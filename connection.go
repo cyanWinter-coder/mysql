@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -47,6 +48,9 @@ type mysqlConn struct {
 	finished chan<- struct{}
 	canceled atomicError // set non-nil if conn is canceled
 	closed   atomic.Bool // set when conn is closed, before closech is closed
+
+	stmtCacheMu sync.Mutex
+	*stmtCache
 }
 
 // Helper function to call per-connection logger.
@@ -186,6 +190,7 @@ func (mc *mysqlConn) cleanup() {
 	if mc.closed.Swap(true) {
 		return
 	}
+	mc.invalidateStmtCache()
 
 	// Makes cleanup idempotent
 	close(mc.closech)
@@ -211,7 +216,54 @@ func (mc *mysqlConn) error() error {
 	return nil
 }
 
+func (mc *mysqlConn) statementCache() *stmtCache {
+	mc.stmtCacheMu.Lock()
+	defer mc.stmtCacheMu.Unlock()
+	if mc.stmtCache == nil {
+		mc.stmtCache = newStmtCache()
+	}
+	return mc.stmtCache
+}
+
+// invalidateStmtCache drops all connection-scoped statement entries. The
+// server releases the statement IDs when the connection socket is closed, so
+// this does not send COM_STMT_CLOSE.
+func (mc *mysqlConn) invalidateStmtCache() {
+	mc.stmtCacheMu.Lock()
+	cache := mc.stmtCache
+	mc.stmtCacheMu.Unlock()
+	cache.clear()
+}
+
+func (mc *mysqlConn) evictStmtCache(query string) {
+	mc.stmtCacheMu.Lock()
+	cache := mc.stmtCache
+	mc.stmtCacheMu.Unlock()
+	cache.remove(query, nil)
+}
+
 func (mc *mysqlConn) Prepare(query string) (driver.Stmt, error) {
+	if mc.closed.Load() {
+		return nil, driver.ErrBadConn
+	}
+
+	cache := mc.statementCache()
+	if stmt, ok := cache.acquire(query); ok && stmt.mc == mc && !mc.closed.Load() && stmt.id != 0 {
+		return stmt, nil
+	}
+
+	stmt, err := mc.prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	stmt.refs = &stmtRefs{count: 1}
+	cache.put(query, stmt)
+	return stmt, nil
+}
+
+// prepare always sends COM_STMT_PREPARE. It is used by Prepare cache misses
+// and transparent re-preparation.
+func (mc *mysqlConn) prepare(query string) (*mysqlStmt, error) {
 	if mc.closed.Load() {
 		return nil, driver.ErrBadConn
 	}
@@ -224,7 +276,8 @@ func (mc *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 	}
 
 	stmt := &mysqlStmt{
-		mc: mc,
+		mc:          mc,
+		queryString: query,
 	}
 
 	// Read Result
@@ -700,6 +753,9 @@ func (stmt *mysqlStmt) QueryContext(ctx context.Context, args []driver.NamedValu
 	if err != nil {
 		return nil, err
 	}
+	if stmt.mc == nil {
+		return nil, driver.ErrBadConn
+	}
 
 	if err := stmt.mc.watchCancel(ctx); err != nil {
 		return nil, err
@@ -718,6 +774,9 @@ func (stmt *mysqlStmt) ExecContext(ctx context.Context, args []driver.NamedValue
 	dargs, err := namedValueToValue(args)
 	if err != nil {
 		return nil, err
+	}
+	if stmt.mc == nil {
+		return nil, driver.ErrBadConn
 	}
 
 	if err := stmt.mc.watchCancel(ctx); err != nil {

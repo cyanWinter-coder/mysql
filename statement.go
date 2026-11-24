@@ -11,35 +11,153 @@ package mysql
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
+	"sync"
 )
 
 type mysqlStmt struct {
-	mc         *mysqlConn
-	id         uint32
-	paramCount int
-	columns    []mysqlField
+	mc          *mysqlConn
+	id          uint32
+	paramCount  int
+	columns     []mysqlField
+	queryString string
+
+	closeMu sync.Mutex
+	closed  bool
+	refs    *stmtRefs
+}
+
+// stmtRefs counts Prepare handles that share one server-side statement ID.
+type stmtRefs struct {
+	mu    sync.Mutex
+	count int
+}
+
+func (r *stmtRefs) retain() {
+	r.mu.Lock()
+	r.count++
+	r.mu.Unlock()
+}
+
+// release decrements the count and reports whether the server statement must
+// now be closed.
+func (r *stmtRefs) release() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.count--
+	return r.count <= 0
+}
+
+// newHandle creates an independent Close handle for a shared statement. The
+// protocol fields are copied; Close state is not shared.
+func (stmt *mysqlStmt) newHandle() *mysqlStmt {
+	return &mysqlStmt{
+		mc:          stmt.mc,
+		id:          stmt.id,
+		paramCount:  stmt.paramCount,
+		columns:     stmt.columns,
+		queryString: stmt.queryString,
+		refs:        stmt.refs,
+	}
 }
 
 func (stmt *mysqlStmt) Close() error {
-	if stmt.mc == nil || stmt.mc.closed.Load() {
-		// driver.Stmt.Close could be called more than once, thus this function
-		// had to be idempotent. See also Issue #450 and golang/go#16019.
-		// This bug has been fixed in Go 1.8.
-		// https://github.com/golang/go/commit/90b8a0ca2d0b565c7c7199ffcf77b15ea6b6db3a
-		// But we keep this function idempotent because it is safer.
+	stmt.closeMu.Lock()
+	defer stmt.closeMu.Unlock()
+
+	// driver.Stmt.Close can be called more than once, thus this function has
+	// to be idempotent. See also Issue #450 and golang/go#16019.
+	// This bug has been fixed in Go 1.8.
+	// https://github.com/golang/go/commit/90b8a0ca2d0b565c7c7199ffcf77b15ea6b6db3a
+	// But we keep this function idempotent because it is safer.
+	if stmt.closed {
+		return nil
+	}
+	stmt.closed = true
+
+	mc := stmt.mc
+	query := stmt.queryString
+	if mc != nil {
+		// Closing any owner evicts the text from the lookup cache. Other
+		// handles that already acquired the statement remain valid until they
+		// are closed too.
+		mc.evictStmtCache(query)
+	}
+	lastHandle := true
+	if stmt.refs != nil {
+		lastHandle = stmt.refs.release()
+	}
+
+	if mc == nil || mc.closed.Load() {
+		stmt.mc = nil
+		if mc != nil {
+			mc.invalidateStmtCache()
+		}
 		return nil
 	}
 
-	err := stmt.mc.writeCommandPacketUint32(comStmtClose, stmt.id)
+	if !lastHandle {
+		stmt.mc = nil
+		return nil
+	}
+
+	err := mc.writeCommandPacketUint32(comStmtClose, stmt.id)
 	stmt.mc = nil
 	return err
 }
 
 func (stmt *mysqlStmt) NumInput() int {
 	return stmt.paramCount
+}
+
+// MySQL error codes that mean a server-side statement ID can no longer be
+// executed even though the client connection itself is still usable.
+const (
+	erUnknownStmtHandler = 1243
+	erNeedReprepare      = 1615
+)
+
+func staleStatementError(err error) bool {
+	var merr *MySQLError
+	return errors.As(err, &merr) &&
+		(merr.Number == erUnknownStmtHandler || merr.Number == erNeedReprepare)
+}
+
+// reprepare replaces the server statement with a freshly prepared one using
+// the original SQL text. It is used after the server invalidates a statement
+// (for example after a schema change) and by reconnect/retry paths.
+func (stmt *mysqlStmt) reprepare() error {
+	mc := stmt.mc
+	if mc == nil || mc.closed.Load() {
+		return driver.ErrBadConn
+	}
+	if stmt.queryString == "" {
+		return errors.New("mysql: cannot reprepare statement without SQL text")
+	}
+
+	newStmt, err := mc.prepare(stmt.queryString)
+	if err != nil {
+		return err
+	}
+
+	oldID := stmt.id
+	stmt.id = newStmt.id
+	stmt.paramCount = newStmt.paramCount
+	stmt.columns = newStmt.columns
+	stmt.closed = false
+	mc.statementCache().put(stmt.queryString, stmt)
+
+	// The old ID is no longer needed. COM_STMT_CLOSE has no response, so a
+	// failure here only means the connection is already going to be discarded.
+	if oldID != 0 && oldID != newStmt.id {
+		if err := mc.writeCommandPacketUint32(comStmtClose, oldID); err != nil {
+			mc.log("closing stale prepared statement:", err)
+		}
+	}
+	return nil
 }
 
 func (stmt *mysqlStmt) ColumnConverter(idx int) driver.ValueConverter {
@@ -64,7 +182,17 @@ func (stmt *mysqlStmt) readColumns(count int, metadataFollows bool) error {
 }
 
 func (stmt *mysqlStmt) Exec(args []driver.Value) (driver.Result, error) {
-	if stmt.mc.closed.Load() {
+	result, err := stmt.execOnce(args)
+	if err != nil && staleStatementError(err) {
+		if reprepareErr := stmt.reprepare(); reprepareErr == nil {
+			return stmt.execOnce(args)
+		}
+	}
+	return result, err
+}
+
+func (stmt *mysqlStmt) execOnce(args []driver.Value) (driver.Result, error) {
+	if stmt.mc == nil || stmt.mc.closed.Load() || stmt.closed {
 		return nil, driver.ErrBadConn
 	}
 	// Send command
@@ -113,7 +241,17 @@ func (stmt *mysqlStmt) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (stmt *mysqlStmt) query(args []driver.Value) (*binaryRows, error) {
-	if stmt.mc.closed.Load() {
+	rows, err := stmt.queryOnce(args)
+	if err != nil && staleStatementError(err) {
+		if reprepareErr := stmt.reprepare(); reprepareErr == nil {
+			return stmt.queryOnce(args)
+		}
+	}
+	return rows, err
+}
+
+func (stmt *mysqlStmt) queryOnce(args []driver.Value) (*binaryRows, error) {
+	if stmt.mc == nil || stmt.mc.closed.Load() || stmt.closed {
 		return nil, driver.ErrBadConn
 	}
 	// Send command
