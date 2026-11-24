@@ -137,7 +137,15 @@ This has the same effect as an empty DSN string:
 Alternatively, [Config.FormatDSN](https://godoc.org/github.com/go-sql-driver/mysql#Config.FormatDSN) can be used to create a DSN string by filling a struct.
 
 #### Password
-Passwords can consist of any character. Escaping is **not** necessary.
+Passwords can consist of any character. Escaping is **not** necessary for
+DSNs written by hand: characters such as `@` and `/` are interpreted in their
+structural positions only. When a DSN is produced by `Config.FormatDSN`,
+structural characters in the username and password (`@`, `:`, `/`, `?`, `&`,
+`=`, `%`, whitespace and non-ASCII characters) are percent-encoded so that
+parsing the formatted DSN reproduces the original credentials. `ParseDSN`
+decodes such escapes, while a literal `%` that is not part of a valid
+percent-escape (for example in an unescaped legacy password like `100%`) is
+left unchanged.
 
 #### Protocol
 See [net.Dial](https://golang.org/pkg/net/#Dial) for more information which networks are available.
@@ -525,6 +533,13 @@ Rules:
  (which implies values of string variables must be wrapped with `%27`).
 * System variables are set and retained by `FormatDSN` in the order they appear in the DSN.
   Use `Config.Apply(AddParam(name, value))` to preserve order when adding them programmatically.
+* Unknown parameter names never cause `ParseDSN` to fail. They are stored as
+  connection parameters and sent to the server as system variables. If a name
+  is one edit away from a known driver parameter (for example `timout` instead
+  of `timeout`), a warning suggesting the likely intended parameter is logged;
+  ordinary system variables stay silent. A malformed percent-escape in an
+  unknown parameter value is likewise tolerated: the raw value is kept and a
+  warning is logged instead of rejecting the DSN.
 
 Examples:
   * `autocommit=1`: `SET autocommit=1`

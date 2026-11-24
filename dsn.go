@@ -33,6 +33,136 @@ var (
 	errUnsafeCharset       = errors.New("interpolateParams cannot be used with unsafe charsets")
 )
 
+// knownDSNParams is the set of DSN parameter names the driver understands.
+// It is used to recognize likely misspellings of driver parameters among the
+// unknown parameters, which are otherwise treated as system variables (see
+// Config.Params).
+var knownDSNParams = map[string]struct{}{
+	"allowAllFiles":            {},
+	"allowCleartextPasswords":  {},
+	"allowFallbackToPlaintext": {},
+	"allowNativePasswords":     {},
+	"allowOldPasswords":        {},
+	"checkConnLiveness":        {},
+	"charset":                  {},
+	"clientFoundRows":          {},
+	"collation":                {},
+	"columnsWithAlias":         {},
+	"compress":                 {},
+	"connectionAttributes":     {},
+	"interpolateParams":        {},
+	"loc":                      {},
+	"maxAllowedPacket":         {},
+	"multiStatements":          {},
+	"parseTime":                {},
+	"readTimeout":              {},
+	"rejectReadOnly":           {},
+	"serverPubKey":             {},
+	"strict":                   {},
+	"timeout":                  {},
+	"timeTruncate":             {},
+	"tinyInt1IsBool":           {},
+	"tls":                      {},
+	"writeTimeout":             {},
+}
+
+// knownDSNParamNamesLower holds the lowercase form of each entry in
+// knownDSNParams, prepared once so suggestDSNParam does not allocate while
+// scanning candidates.
+var knownDSNParamNamesLower = func() []string {
+	names := make([]string, 0, len(knownDSNParams))
+	for name := range knownDSNParams {
+		names = append(names, strings.ToLower(name))
+	}
+	sort.Strings(names)
+	return names
+}()
+
+// canonicalDSNParamName maps a lowercase parameter name back to its
+// canonical spelling for warning messages.
+var canonicalDSNParamName = func() map[string]string {
+	names := make(map[string]string, len(knownDSNParams))
+	for name := range knownDSNParams {
+		names[strings.ToLower(name)] = name
+	}
+	return names
+}()
+
+// maxDSNParamSuggestionLen is the longest parameter name for which a
+// misspelling suggestion is attempted; longer names are treated as ordinary
+// system variables. Driver parameter names are far shorter.
+const maxDSNParamSuggestionLen = 128
+
+// oneEditAway reports whether two equal-length strings are a single
+// substitution or a single adjacent transposition apart.
+func oneEditAway(a, b string) bool {
+	first := -1
+	for i := 0; i < len(a); i++ {
+		if a[i] == b[i] {
+			continue
+		}
+		if first < 0 {
+			first = i
+			continue
+		}
+		// A second difference is only acceptable as the other half of an
+		// adjacent transposition; everything else is at least two edits.
+		return i == first+1 && a[first] == b[i] && a[i] == b[first] &&
+			// no further differences after the swapped pair
+			a[i+1:] == b[i+1:]
+	}
+	return first >= 0
+}
+
+// oneInsertionAway reports whether longer is one insertion away from shorter,
+// i.e. shorter is longer with a single character removed (and vice versa).
+func oneInsertionAway(shorter, longer string) bool {
+	i, j := 0, 0
+	for i < len(shorter) && j < len(longer) {
+		if shorter[i] == longer[j] {
+			i++
+			j++
+			continue
+		}
+		j++
+		if j-i > 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// suggestDSNParam returns the canonical name of a known driver parameter the
+// given key is one edit away from (a likely typo), or "" otherwise. Ordinary
+// system variables such as "autocommit" produce no suggestion, so the common
+// DSN path stays cheap.
+func suggestDSNParam(key string) string {
+	if key == "" || len(key) > maxDSNParamSuggestionLen {
+		return ""
+	}
+	lowerKey := strings.ToLower(key)
+	for _, known := range knownDSNParamNamesLower {
+		switch len(known) - len(lowerKey) {
+		case 0:
+			// Substitution, transposition, or identical (an identical name
+			// cannot reach this function: known keys are handled by the
+			// switch in parseDSNParams).
+			if lowerKey != known && oneEditAway(lowerKey, known) {
+				return canonicalDSNParamName[known]
+			}
+		case 1:
+			if oneInsertionAway(lowerKey, known) {
+				return canonicalDSNParamName[known]
+			}
+		case -1:
+			if oneInsertionAway(known, lowerKey) {
+				return canonicalDSNParamName[known]
+			}
+		}
+	}
+	return ""
+}
+
 // Config is a configuration parsed from a DSN string.
 // If a new Config is created instead of being parsed from a DSN string,
 // the NewConfig function should be used, which sets default values.
@@ -330,10 +460,10 @@ func (cfg *Config) FormatDSN() string {
 
 	// [username[:password]@]
 	if len(cfg.User) > 0 {
-		buf.WriteString(cfg.User)
+		buf.WriteString(escapeUserinfo(cfg.User))
 		if len(cfg.Passwd) > 0 {
 			buf.WriteByte(':')
-			buf.WriteString(cfg.Passwd)
+			buf.WriteString(escapeUserinfo(cfg.Passwd))
 		}
 		buf.WriteByte('@')
 	}
@@ -496,9 +626,78 @@ func (cfg *Config) orderedParams() []string {
 	return append(params, unordered...)
 }
 
-// ParseDSN parses the DSN string to a Config
+// unescapeUserinfo percent-decodes the user/password section of a DSN.
+//
+// The section historically carried no escaping rules, so a value without
+// valid percent-escapes is returned unchanged instead of failing: plain
+// passwords containing '%' (e.g. "100%") must keep working.
+func unescapeUserinfo(value string) string {
+	if !strings.ContainsRune(value, '%') {
+		return value
+	}
+	if decoded, err := url.PathUnescape(value); err == nil {
+		return decoded
+	}
+	return value
+}
+
+// shouldEscapeUserinfo reports whether the byte must be percent-encoded in
+// the userinfo section of a DSN: the structural characters ('@', ':', '/',
+// '(', ')', '?', '&', '=', '%'), whitespace, non-printables and non-ASCII.
+func shouldEscapeUserinfo(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return false
+	case c == '-' || c == '_' || c == '.' || c == '~' || c == '!' ||
+		c == '$' || c == '\'' || c == '(' || c == ')' || c == '*' ||
+		c == '+' || c == ',' || c == ';':
+		// Unreserved and sub-delim characters that carry no structural
+		// meaning in the userinfo section.
+		return false
+	default:
+		return true
+	}
+}
+
+// escapeUserinfo percent-encodes every structural or non-ASCII character in
+// the DSN userinfo section so that credentials round-trip through
+// ParseDSN/FormatDSN. Unreserved ASCII characters are kept verbatim.
+func escapeUserinfo(value string) string {
+	// Fast path: the common credential consists solely of unreserved bytes,
+	// so avoid allocating a builder.
+	needsEscape := false
+	for i := 0; i < len(value); i++ {
+		if shouldEscapeUserinfo(value[i]) {
+			needsEscape = true
+			break
+		}
+	}
+	if !needsEscape {
+		return value
+	}
+
+	var b strings.Builder
+	b.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if !shouldEscapeUserinfo(c) {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte("0123456789ABCDEF"[c>>4])
+		b.WriteByte("0123456789ABCDEF"[c&15])
+	}
+	return b.String()
+}
+
+// ParseDSN parses the DSN string to a Config.
+// It never returns a partially initialized Config: on any error the
+// returned Config is nil.
 func ParseDSN(dsn string) (cfg *Config, err error) {
-	// New config with some default values
+	// New config with some default values. On every error path below this
+	// config is discarded and nil is returned, so callers can never observe
+	// a half-initialized configuration.
 	cfg = NewConfig()
 
 	// [user[:password]@][net[(addr)]]/dbname[?param1=value1&paramN=valueN]
@@ -516,14 +715,16 @@ func ParseDSN(dsn string) (cfg *Config, err error) {
 				for j = i; j >= 0; j-- {
 					if dsn[j] == '@' {
 						// username[:password]
-						// Find the first ':' in dsn[:j]
+						// Find the first ':' in dsn[:j]. It is the password
+						// delimiter; the username itself never contains a raw
+						// colon because FormatDSN percent-escapes it.
 						for k = 0; k < j; k++ { // We cannot use k = range j here, because we use dsn[:k] below
 							if dsn[k] == ':' {
-								cfg.Passwd = dsn[k+1 : j]
+								cfg.Passwd = unescapeUserinfo(dsn[k+1 : j])
 								break
 							}
 						}
-						cfg.User = dsn[:k]
+						cfg.User = unescapeUserinfo(dsn[:k])
 
 						break
 					}
@@ -552,7 +753,7 @@ func ParseDSN(dsn string) (cfg *Config, err error) {
 			for j = i + 1; j < len(dsn); j++ {
 				if dsn[j] == '?' {
 					if err = parseDSNParams(cfg, dsn[j+1:]); err != nil {
-						return
+						return nil, err
 					}
 					break
 				}
@@ -574,11 +775,46 @@ func ParseDSN(dsn string) (cfg *Config, err error) {
 	if err = cfg.normalize(); err != nil {
 		return nil, err
 	}
-	return
+	return cfg, nil
 }
 
-// parseDSNParams parses the DSN "query string"
-// Values must be url.QueryEscape'ed
+// parseDSNBool parses a boolean DSN parameter and names the parameter in the
+// error so misconfiguration points at the offending field.
+func parseDSNBool(name, value string) (bool, error) {
+	v, ok := readBool(value)
+	if !ok {
+		return false, fmt.Errorf("invalid %s value %q: want one of true, false, 1, 0", name, value)
+	}
+	return v, nil
+}
+
+// parseDSNDuration parses a duration DSN parameter (time.ParseDuration syntax,
+// e.g. "500ms", "1s", "2m30s") and names the parameter in the error.
+func parseDSNDuration(name, value string) (time.Duration, error) {
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s value %q: %w", name, value, err)
+	}
+	return d, nil
+}
+
+// parseDSNCharset splits and validates a comma-delimited charset parameter.
+// Empty entries (e.g. a trailing comma or ",,") are rejected and the field
+// name is included in the error.
+func parseDSNCharset(value string) ([]string, error) {
+	charsets := strings.Split(value, ",")
+	for i, charset := range charsets {
+		if strings.TrimSpace(charset) == "" {
+			return nil, fmt.Errorf("invalid charset value %q: empty charset at position %d", value, i+1)
+		}
+	}
+	return charsets, nil
+}
+
+// parseDSNParams parses the DSN "query string".
+// Values must be url.QueryEscape'ed. Unknown parameter names do not fail
+// parsing: they are kept as connection parameters (system variables) and a
+// warning is logged, so DSNs migrated from other clients keep working.
 func parseDSNParams(cfg *Config, params string) (err error) {
 	for v := range strings.SplitSeq(params, "&") {
 		key, value, found := strings.Cut(v, "=")
@@ -590,137 +826,112 @@ func parseDSNParams(cfg *Config, params string) (err error) {
 		switch key {
 		// Disable INFILE allowlist / enable all files
 		case "allowAllFiles":
-			var isBool bool
-			cfg.AllowAllFiles, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.AllowAllFiles, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// Use cleartext authentication mode (MySQL 5.5.10+)
 		case "allowCleartextPasswords":
-			var isBool bool
-			cfg.AllowCleartextPasswords, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.AllowCleartextPasswords, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// Allow fallback to unencrypted connection if server does not support TLS
 		case "allowFallbackToPlaintext":
-			var isBool bool
-			cfg.AllowFallbackToPlaintext, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.AllowFallbackToPlaintext, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// Use native password authentication
 		case "allowNativePasswords":
-			var isBool bool
-			cfg.AllowNativePasswords, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.AllowNativePasswords, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// Use old authentication mode (pre MySQL 4.1)
 		case "allowOldPasswords":
-			var isBool bool
-			cfg.AllowOldPasswords, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.AllowOldPasswords, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// Check connections for Liveness before using them
 		case "checkConnLiveness":
-			var isBool bool
-			cfg.CheckConnLiveness, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.CheckConnLiveness, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// Switch "rowsAffected" mode
 		case "clientFoundRows":
-			var isBool bool
-			cfg.ClientFoundRows, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.ClientFoundRows, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// charset
 		case "charset":
-			cfg.charsets = strings.Split(value, ",")
+			if cfg.charsets, err = parseDSNCharset(value); err != nil {
+				return err
+			}
 
 		// Collation
 		case "collation":
 			cfg.Collation = value
 
 		case "columnsWithAlias":
-			var isBool bool
-			cfg.ColumnsWithAlias, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.ColumnsWithAlias, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// Compression
 		case "compress":
-			var isBool bool
-			cfg.compress, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.compress, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// Enable client side placeholder substitution
 		case "interpolateParams":
-			var isBool bool
-			cfg.InterpolateParams, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.InterpolateParams, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// Time Location
 		case "loc":
 			if value, err = url.QueryUnescape(value); err != nil {
-				return
+				return fmt.Errorf("invalid loc value %q: %w", value, err)
 			}
 			cfg.Loc, err = time.LoadLocation(value)
 			if err != nil {
-				return
+				return fmt.Errorf("invalid loc value %q: %w", value, err)
 			}
 
 		// multiple statements in one query
 		case "multiStatements":
-			var isBool bool
-			cfg.MultiStatements, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.MultiStatements, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// time.Time parsing
 		case "parseTime":
-			var isBool bool
-			cfg.ParseTime, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.ParseTime, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// I/O read Timeout
 		case "readTimeout":
-			cfg.ReadTimeout, err = time.ParseDuration(value)
-			if err != nil {
-				return
+			if cfg.ReadTimeout, err = parseDSNDuration(key, value); err != nil {
+				return err
 			}
 
 		// Reject read-only connections
 		case "rejectReadOnly":
-			var isBool bool
-			cfg.RejectReadOnly, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.RejectReadOnly, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// Server public key
 		case "serverPubKey":
 			name, err := url.QueryUnescape(value)
 			if err != nil {
-				return fmt.Errorf("invalid value for server pub key name: %v", err)
+				return fmt.Errorf("invalid serverPubKey value %q: %w", value, err)
 			}
 			cfg.ServerPubKey = name
 
@@ -730,24 +941,20 @@ func parseDSNParams(cfg *Config, params string) (err error) {
 
 		// Dial Timeout
 		case "timeout":
-			cfg.Timeout, err = time.ParseDuration(value)
-			if err != nil {
-				return
+			if cfg.Timeout, err = parseDSNDuration(key, value); err != nil {
+				return err
 			}
 
 		// time.Time truncation
 		case "timeTruncate":
-			cfg.timeTruncate, err = time.ParseDuration(value)
-			if err != nil {
-				return fmt.Errorf("invalid timeTruncate value: %v, error: %w", value, err)
+			if cfg.timeTruncate, err = parseDSNDuration(key, value); err != nil {
+				return err
 			}
 
 		// Treat TINYINT(1) as boolean
 		case "tinyInt1IsBool":
-			var isBool bool
-			cfg.tinyInt1IsBool, isBool = readBool(value)
-			if !isBool {
-				return errors.New("invalid bool value: " + value)
+			if cfg.tinyInt1IsBool, err = parseDSNBool(key, value); err != nil {
+				return err
 			}
 
 		// TLS-Encryption
@@ -764,35 +971,48 @@ func parseDSNParams(cfg *Config, params string) (err error) {
 			} else {
 				name, err := url.QueryUnescape(value)
 				if err != nil {
-					return fmt.Errorf("invalid value for TLS config name: %v", err)
+					return fmt.Errorf("invalid tls value %q: %w", value, err)
 				}
 				cfg.TLSConfig = name
 			}
 
 		// I/O write Timeout
 		case "writeTimeout":
-			cfg.WriteTimeout, err = time.ParseDuration(value)
-			if err != nil {
-				return
+			if cfg.WriteTimeout, err = parseDSNDuration(key, value); err != nil {
+				return err
 			}
 		case "maxAllowedPacket":
 			cfg.MaxAllowedPacket, err = strconv.Atoi(value)
 			if err != nil {
-				return
+				return fmt.Errorf("invalid maxAllowedPacket value %q: %w", value, err)
 			}
 
 		// Connection attributes
 		case "connectionAttributes":
 			connectionAttributes, err := url.QueryUnescape(value)
 			if err != nil {
-				return fmt.Errorf("invalid connectionAttributes value: %v", err)
+				return fmt.Errorf("invalid connectionAttributes value %q: %w", value, err)
 			}
 			cfg.ConnectionAttributes = connectionAttributes
 
 		default:
-			value, err = url.QueryUnescape(value)
-			if err != nil {
-				return
+			// Unknown parameters are kept as connection parameters (system
+			// variables sent with SET) instead of failing the whole parse, so
+			// DSNs containing historical or foreign parameters still connect.
+			// Warn only when the name looks like a misspelling of a driver
+			// parameter, so ordinary system variables stay silent.
+			if key != "" {
+				if suggestion := suggestDSNParam(key); suggestion != "" {
+					cfg.Logger.Print("unknown DSN parameter: ", key, " (did you mean ", suggestion, "?)")
+				}
+			}
+
+			// Tolerate malformed percent-escapes in migrated parameter values:
+			// keep the raw value with a warning rather than dropping the DSN.
+			unescaped, unescapeErr := url.QueryUnescape(value)
+			if unescapeErr != nil {
+				cfg.Logger.Print("invalid URL escape in DSN parameter ", key, ": ", unescapeErr)
+				unescaped = value
 			}
 
 			// lazy init
@@ -805,7 +1025,7 @@ func parseDSNParams(cfg *Config, params string) (err error) {
 			if i := slices.Index(cfg.paramOrder, key); i >= 0 {
 				cfg.paramOrder = slices.Delete(cfg.paramOrder, i, i+1)
 			}
-			cfg.Params[key] = value
+			cfg.Params[key] = unescaped
 			cfg.paramOrder = append(cfg.paramOrder, key)
 		}
 	}
