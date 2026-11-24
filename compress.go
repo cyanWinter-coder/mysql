@@ -21,6 +21,7 @@ import (
 var (
 	zrPool *sync.Pool // Do not use directly. Use zDecompress() instead.
 	zwPool *sync.Pool // Do not use directly. Use zCompress() instead.
+	brPool *sync.Pool // Reusable bytes.Reader values for zDecompress.
 )
 
 func init() {
@@ -36,10 +37,16 @@ func init() {
 			return zw
 		},
 	}
+	brPool = &sync.Pool{
+		New: func() any { return new(bytes.Reader) },
+	}
 }
 
 func zDecompress(src []byte, dst *bytes.Buffer, limit int) (int, error) {
-	br := bytes.NewReader(src)
+	br := brPool.Get().(*bytes.Reader)
+	br.Reset(src)
+	defer brPool.Put(br)
+
 	var zr io.ReadCloser
 	var err error
 
@@ -200,7 +207,7 @@ const maxPayloadLen = maxPacketSize - 4
 // Use this instead of mc.netConn.Write() when mc.compress is true.
 func (c *compIO) writePackets(packets []byte) (int, error) {
 	totalBytes := len(packets)
-	blankHeader := make([]byte, 7)
+	var blankHeader [7]byte
 	buf := &c.buff
 
 	for len(packets) > 0 {
@@ -209,7 +216,7 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 		uncompressedLen := payloadLen
 
 		buf.Reset()
-		buf.Write(blankHeader) // Buffer.Write() never returns error
+		buf.Write(blankHeader[:]) // Buffer.Write() never returns error
 
 		// If payload is less than minCompressLength, don't compress.
 		if uncompressedLen < minCompressLength {
@@ -231,7 +238,7 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 			// I intentionally miss 7 byte header in the buf; zCompress must compress more than 7 bytes.
 			if err != nil || buf.Len() >= uncompressedLen {
 				buf.Reset()
-				buf.Write(blankHeader)
+				buf.Write(blankHeader[:])
 				buf.Write(payload)
 				uncompressedLen = 0
 			}

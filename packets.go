@@ -42,6 +42,7 @@ func (mc *mysqlConn) readNext(n int) ([]byte, error) {
 // Read packet to buffer 'data'
 func (mc *mysqlConn) readPacket() ([]byte, error) {
 	var prevData []byte
+	havePrevData := false
 	invalidSequence := false
 
 	readNext := mc.readNext
@@ -65,13 +66,22 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 		pktLen := getUint24(data[:3])
 		seq := data[3]
 
+		// A 24-bit length can never exceed maxPacketSize, but keep the check
+		// explicit for packets constructed by tests or future codec callers.
+		if pktLen > maxPacketSize {
+			err = ErrPktTooLarge
+			mc.log(err)
+			mc.close()
+			return nil, err
+		}
+
 		// check packet sync [8 bit]
 		if seq != mc.sequence {
 			mc.log(fmt.Sprintf("[warn] unexpected sequence nr: expected %v, got %v", mc.sequence, seq))
 			// MySQL and MariaDB doesn't check packet nr in compressed packet.
 			if !mc.compress {
 				// For large packets, we stop reading as soon as sync error.
-				if len(prevData) > 0 {
+				if havePrevData {
 					mc.close()
 					return nil, ErrPktSyncMul
 				}
@@ -80,15 +90,32 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 		}
 		mc.sequence = seq + 1
 
+		// Enforce max_allowed_packet on the reassembled payload before
+		// reading and potentially copying its body into memory. A zero limit
+		// means "no client-side limit", as used by low-level unit tests.
+		if mc.maxAllowedPacket > 0 {
+			received := 0
+			if havePrevData {
+				received = len(prevData)
+			}
+			if pktLen > mc.maxAllowedPacket || received > mc.maxAllowedPacket-pktLen {
+				err = ErrPktTooLarge
+				mc.log(err)
+				mc.close()
+				return nil, err
+			}
+		}
+
 		// packets with length 0 terminate a previous packet which is a
 		// multiple of (2^24)-1 bytes long
 		if pktLen == 0 {
 			// there was no previous packet
-			if prevData == nil {
+			if !havePrevData {
 				mc.log(ErrMalformPkt)
 				mc.close()
 				return nil, ErrInvalidConn
 			}
+			mc.packetBuf = prevData
 			return prevData, nil
 		}
 
@@ -106,8 +133,10 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 		// return data if this was the last packet
 		if pktLen < maxPacketSize {
 			// zero allocations for non-split packets
-			if prevData != nil {
-				data = append(prevData, data...)
+			if havePrevData {
+				prevData = append(prevData, data...)
+				mc.packetBuf = prevData
+				data = prevData
 			}
 			if invalidSequence {
 				mc.close()
@@ -120,7 +149,12 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 			return data, nil
 		}
 
+		if !havePrevData {
+			havePrevData = true
+			prevData = mc.packetBuf[:0]
+		}
 		prevData = append(prevData, data...)
+		mc.packetBuf = prevData
 	}
 }
 
@@ -1026,10 +1060,14 @@ func (stmt *mysqlStmt) writeCommandLongData(paramID int, arg []byte) error {
 	// 2 bytes paramID
 	const dataOffset = 1 + 4 + 2
 
-	// Cannot use the write buffer since
-	// a) the buffer is too small
-	// b) it is in use
-	data := make([]byte, 4+1+4+2+len(arg))
+	// Cannot use the regular write buffer since writeExecutePacket may still
+	// own it while long data packets are being sent. Reuse a connection-owned
+	// buffer so repeated large parameters do not allocate on every execution.
+	totalLen := 4 + 1 + 4 + 2 + len(arg)
+	if cap(stmt.mc.longDataBuf) < totalLen {
+		stmt.mc.longDataBuf = make([]byte, totalLen)
+	}
+	data := stmt.mc.longDataBuf[:totalLen]
 
 	copy(data[4+dataOffset:], arg)
 

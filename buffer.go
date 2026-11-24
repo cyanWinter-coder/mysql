@@ -28,6 +28,7 @@ type readerFunc func([]byte) (int, error)
 type buffer struct {
 	buf       []byte // read buffer.
 	cachedBuf []byte // buffer that will be reused. len(cachedBuf) <= maxCachedBufSize.
+	largeBuf  []byte // reused backing storage for reads larger than cachedBuf.
 }
 
 // newBuffer allocates and returns a new buffer.
@@ -54,13 +55,21 @@ func (b *buffer) fill(need int, r readerFunc) error {
 
 	// grow buffer if necessary to fit the whole packet.
 	if need > len(dest) {
-		// Round up to the next multiple of the default size
-		dest = make([]byte, ((need/defaultBufSize)+1)*defaultBufSize)
+		if cap(b.largeBuf) >= need {
+			// Reuse a previous oversized read buffer. This keeps multi-megabyte
+			// packets from allocating fresh backing storage on every read.
+			dest = b.largeBuf[:cap(b.largeBuf)]
+		} else {
+			// Round up to the next multiple of the default size
+			dest = make([]byte, ((need/defaultBufSize)+1)*defaultBufSize)
 
-		// if the allocated buffer is not too large, move it to backing storage
-		// to prevent extra allocations on applications that perform large reads
-		if len(dest) <= maxCachedBufSize {
-			b.cachedBuf = dest
+			// if the allocated buffer is not too large, move it to backing storage
+			// to prevent extra allocations on applications that perform large reads
+			if len(dest) <= maxCachedBufSize {
+				b.cachedBuf = dest
+			} else {
+				b.largeBuf = dest
+			}
 		}
 	}
 
@@ -116,8 +125,17 @@ func (b *buffer) takeBuffer(length int) ([]byte, error) {
 		return b.cachedBuf, nil
 	}
 
-	// buffer is larger than we want to store.
-	return make([]byte, length), nil
+	// Reuse the oversized buffer as well. Large JSON/BLOB arguments are
+	// often written repeatedly on the same pooled connection.
+	if length <= cap(b.largeBuf) {
+		b.largeBuf = b.largeBuf[:length]
+		return b.largeBuf, nil
+	}
+
+	// buffer is larger than the regular cache, but still reuse it on the
+	// next large allocation instead of discarding it immediately.
+	b.largeBuf = make([]byte, length)
+	return b.largeBuf, nil
 }
 
 // takeSmallBuffer is shortcut which can be used if length is
@@ -138,12 +156,19 @@ func (b *buffer) takeCompleteBuffer() ([]byte, error) {
 	if b.busy() {
 		return nil, ErrBusyBuffer
 	}
+	if cap(b.largeBuf) > cap(b.cachedBuf) {
+		b.largeBuf = b.largeBuf[:cap(b.largeBuf)]
+		return b.largeBuf, nil
+	}
 	return b.cachedBuf, nil
 }
 
 // store stores buf, an updated buffer, if its suitable to do so.
 func (b *buffer) store(buf []byte) {
-	if cap(buf) <= maxCachedBufSize && cap(buf) > cap(b.cachedBuf) {
+	switch {
+	case cap(buf) <= maxCachedBufSize && cap(buf) > cap(b.cachedBuf):
 		b.cachedBuf = buf[:cap(buf)]
+	case cap(buf) > maxCachedBufSize && cap(buf) > cap(b.largeBuf):
+		b.largeBuf = buf[:cap(buf)]
 	}
 }

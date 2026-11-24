@@ -25,6 +25,8 @@ import (
 
 type mysqlConn struct {
 	buf              buffer
+	packetBuf        []byte // reused assembly buffer for split protocol packets
+	longDataBuf      []byte // reused COM_STMT_SEND_LONG_DATA encoding buffer
 	netConn          net.Conn
 	rawConn          net.Conn    // underlying connection when netConn is TLS connection.
 	result           mysqlResult // managed by clearResult() and handleOkPacket().
@@ -61,7 +63,11 @@ func (mc *mysqlConn) log(v ...any) {
 		v = append([]any{prefix}, v...)
 	}
 
-	mc.cfg.Logger.Print(v...)
+	logger := defaultLogger
+	if mc.cfg != nil && mc.cfg.Logger != nil {
+		logger = mc.cfg.Logger
+	}
+	logger.Print(v...)
 }
 
 func (mc *mysqlConn) readWithTimeout(b []byte) (int, error) {
@@ -188,7 +194,9 @@ func (mc *mysqlConn) cleanup() {
 	}
 
 	// Makes cleanup idempotent
-	close(mc.closech)
+	if mc.closech != nil {
+		close(mc.closech)
+	}
 	conn := mc.rawConn
 	if conn == nil {
 		return
