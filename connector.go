@@ -116,6 +116,16 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		}
 	}
 	if err != nil {
+		// A dialer may return a connection together with an error. Do not
+		// leak it in that non-standard case.
+		if mc.netConn != nil {
+			_ = mc.netConn.Close()
+		}
+		// A shorter caller deadline remains a caller deadline rather than
+		// being misreported as the DSN "timeout" (dial timeout).
+		if ctx.Err() == nil {
+			err = wrapConnectTimeout(err, cfg.Timeout)
+		}
 		return nil, err
 	}
 	mc.rawConn = mc.netConn

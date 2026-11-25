@@ -24,7 +24,7 @@ type mysqlStmt struct {
 }
 
 func (stmt *mysqlStmt) Close() error {
-	if stmt.mc == nil || stmt.mc.closed.Load() {
+	if stmt == nil || stmt.mc == nil || stmt.mc.closed.Load() {
 		// driver.Stmt.Close could be called more than once, thus this function
 		// had to be idempotent. See also Issue #450 and golang/go#16019.
 		// This bug has been fixed in Go 1.8.
@@ -63,9 +63,16 @@ func (stmt *mysqlStmt) readColumns(count int, metadataFollows bool) error {
 	return err
 }
 
+func errStmtClosed(stmt *mysqlStmt) error {
+	if stmt != nil && stmt.mc != nil {
+		return stmt.mc.closedConnectionError()
+	}
+	return ErrConnClosed
+}
+
 func (stmt *mysqlStmt) Exec(args []driver.Value) (driver.Result, error) {
-	if stmt.mc.closed.Load() {
-		return nil, driver.ErrBadConn
+	if stmt == nil || stmt.mc == nil || stmt.mc.closed.Load() {
+		return nil, errStmtClosed(stmt)
 	}
 	// Send command
 	err := stmt.writeExecutePacket(args)
@@ -113,8 +120,8 @@ func (stmt *mysqlStmt) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (stmt *mysqlStmt) query(args []driver.Value) (*binaryRows, error) {
-	if stmt.mc.closed.Load() {
-		return nil, driver.ErrBadConn
+	if stmt == nil || stmt.mc == nil || stmt.mc.closed.Load() {
+		return nil, errStmtClosed(stmt)
 	}
 	// Send command
 	err := stmt.writeExecutePacket(args)

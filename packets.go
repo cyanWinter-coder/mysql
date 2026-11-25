@@ -58,6 +58,9 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 				return nil, cerr
 			}
 			mc.log(err)
+			if errors.Is(err, ErrReadTimeout) {
+				return nil, fmt.Errorf("%w: %w", ErrInvalidConn, err)
+			}
 			return nil, ErrInvalidConn
 		}
 
@@ -100,6 +103,9 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 				return nil, cerr
 			}
 			mc.log(err)
+			if errors.Is(err, ErrReadTimeout) {
+				return nil, fmt.Errorf("%w: %w", ErrInvalidConn, err)
+			}
 			return nil, ErrInvalidConn
 		}
 
@@ -157,6 +163,9 @@ func (mc *mysqlConn) writePacket(data []byte) error {
 				// nothing of the command was written yet
 				mc.cleanup()
 				mc.log(err)
+				if errors.Is(err, ErrWriteTimeout) {
+					return fmt.Errorf("%w: %w", errBadConnNoWrite, err)
+				}
 				return errBadConnNoWrite
 			}
 			// Part of the command was sent. The server may have rejected it

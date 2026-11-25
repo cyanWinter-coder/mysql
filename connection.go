@@ -13,12 +13,14 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -47,6 +49,14 @@ type mysqlConn struct {
 	finished chan<- struct{}
 	canceled atomicError // set non-nil if conn is canceled
 	closed   atomic.Bool // set when conn is closed, before closech is closed
+	closeMu  sync.Mutex  // serializes graceful Close calls
+}
+
+func (mc *mysqlConn) logger() Logger {
+	if mc.cfg != nil && mc.cfg.Logger != nil {
+		return mc.cfg.Logger
+	}
+	return defaultLogger
 }
 
 // Helper function to call per-connection logger.
@@ -61,27 +71,55 @@ func (mc *mysqlConn) log(v ...any) {
 		v = append([]any{prefix}, v...)
 	}
 
-	mc.cfg.Logger.Print(v...)
+	mc.logger().Print(v...)
+}
+
+func (mc *mysqlConn) readTimeout() time.Duration {
+	if mc.cfg != nil {
+		return mc.cfg.ReadTimeout
+	}
+	return 0
+}
+
+func (mc *mysqlConn) writeTimeout() time.Duration {
+	if mc.cfg != nil {
+		return mc.cfg.WriteTimeout
+	}
+	return 0
 }
 
 func (mc *mysqlConn) readWithTimeout(b []byte) (int, error) {
-	to := mc.cfg.ReadTimeout
+	to := mc.readTimeout()
 	if to > 0 {
 		if err := mc.netConn.SetReadDeadline(time.Now().Add(to)); err != nil {
 			return 0, err
 		}
 	}
-	return mc.netConn.Read(b)
+	n, err := mc.netConn.Read(b)
+	if err != nil {
+		if cerr := mc.canceled.Value(); cerr != nil {
+			return n, cerr
+		}
+		err = wrapReadTimeout(err, to)
+	}
+	return n, err
 }
 
 func (mc *mysqlConn) writeWithTimeout(b []byte) (int, error) {
-	to := mc.cfg.WriteTimeout
+	to := mc.writeTimeout()
 	if to > 0 {
 		if err := mc.netConn.SetWriteDeadline(time.Now().Add(to)); err != nil {
 			return 0, err
 		}
 	}
-	return mc.netConn.Write(b)
+	n, err := mc.netConn.Write(b)
+	if err != nil {
+		if cerr := mc.canceled.Value(); cerr != nil {
+			return n, cerr
+		}
+		err = wrapWriteTimeout(err, to)
+	}
+	return n, err
 }
 
 func (mc *mysqlConn) resetSequence() {
@@ -136,7 +174,12 @@ func (cfg *Config) setParamsCommand() string {
 // markBadConn replaces errBadConnNoWrite with driver.ErrBadConn.
 // This function is used to return driver.ErrBadConn only when safe to retry.
 func (mc *mysqlConn) markBadConn(err error) error {
-	if err == errBadConnNoWrite {
+	if errors.Is(err, errBadConnNoWrite) {
+		// Preserve timeout classification while still telling database/sql
+		// that the command did not reach the server and may be retried.
+		if errors.Is(err, ErrWriteTimeout) || isTimeoutError(err) {
+			return fmt.Errorf("%w: %w", driver.ErrBadConn, err)
+		}
 		return driver.ErrBadConn
 	}
 	return err
@@ -148,7 +191,7 @@ func (mc *mysqlConn) Begin() (driver.Tx, error) {
 
 func (mc *mysqlConn) begin(readOnly bool) (driver.Tx, error) {
 	if mc.closed.Load() {
-		return nil, driver.ErrBadConn
+		return nil, mc.closedConnectionError()
 	}
 	var q string
 	if readOnly {
@@ -164,11 +207,27 @@ func (mc *mysqlConn) begin(readOnly bool) (driver.Tx, error) {
 }
 
 func (mc *mysqlConn) Close() (err error) {
-	// Makes Close idempotent
-	if !mc.closed.Load() {
+	mc.closeMu.Lock()
+	defer mc.closeMu.Unlock()
+
+	// Makes Close idempotent. A connection that was closed because of a
+	// protocol/context/network error must not send COM_QUIT.
+	if mc.closed.Load() {
+		return nil
+	}
+
+	// Partially initialized test or connector state may not have a buffer or
+	// network connection yet. Closing it must still be safe.
+	if mc.netConn != nil {
+		if mc.buf.cachedBuf == nil {
+			mc.buf = newBuffer()
+		}
 		err = mc.writeCommandPacket(comQuit)
 	}
 	mc.close()
+	if mc.rawConn == nil && mc.netConn != nil {
+		_ = mc.netConn.Close()
+	}
 	return
 }
 
@@ -187,8 +246,11 @@ func (mc *mysqlConn) cleanup() {
 		return
 	}
 
-	// Makes cleanup idempotent
-	close(mc.closech)
+	// Makes cleanup idempotent. A zero-value mysqlConn does not have a
+	// watcher and therefore may have a nil closech.
+	if mc.closech != nil {
+		close(mc.closech)
+	}
 	conn := mc.rawConn
 	if conn == nil {
 		return
@@ -203,17 +265,14 @@ func (mc *mysqlConn) cleanup() {
 
 func (mc *mysqlConn) error() error {
 	if mc.closed.Load() {
-		if err := mc.canceled.Value(); err != nil {
-			return err
-		}
-		return ErrInvalidConn
+		return mc.closedConnectionError()
 	}
 	return nil
 }
 
 func (mc *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 	if mc.closed.Load() {
-		return nil, driver.ErrBadConn
+		return nil, mc.closedConnectionError()
 	}
 	// Send command
 	err := mc.writeCommandPacketStr(comStmtPrepare, query)
@@ -443,7 +502,7 @@ func (mc *mysqlConn) interpolateParams(query string, args []driver.Value) (strin
 
 func (mc *mysqlConn) Exec(query string, args []driver.Value) (driver.Result, error) {
 	if mc.closed.Load() {
-		return nil, driver.ErrBadConn
+		return nil, mc.closedConnectionError()
 	}
 	if len(args) != 0 {
 		if !mc.cfg.InterpolateParams {
@@ -502,7 +561,7 @@ func (mc *mysqlConn) query(query string, args []driver.Value) (*textRows, error)
 	handleOk := mc.clearResult()
 
 	if mc.closed.Load() {
-		return nil, driver.ErrBadConn
+		return nil, mc.closedConnectionError()
 	}
 	if len(args) != 0 {
 		if !mc.cfg.InterpolateParams {
@@ -584,6 +643,12 @@ func (mc *mysqlConn) getSystemVar(name string) (string, error) {
 func (mc *mysqlConn) cancel(err error) {
 	mc.canceled.Set(err)
 	mc.cleanup()
+	// Directly constructed test/custom connections may only set netConn.
+	// Production connections also set rawConn to netConn or the pre-TLS
+	// socket, which cleanup closes.
+	if mc.rawConn == nil && mc.netConn != nil {
+		_ = mc.netConn.Close()
+	}
 }
 
 // finish is called when the query has succeeded.
@@ -601,7 +666,7 @@ func (mc *mysqlConn) finish() {
 // Ping implements driver.Pinger interface
 func (mc *mysqlConn) Ping(ctx context.Context) (err error) {
 	if mc.closed.Load() {
-		return driver.ErrBadConn
+		return mc.closedConnectionError()
 	}
 
 	if err = mc.watchCancel(ctx); err != nil {
@@ -620,7 +685,7 @@ func (mc *mysqlConn) Ping(ctx context.Context) (err error) {
 // BeginTx implements driver.ConnBeginTx interface
 func (mc *mysqlConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if mc.closed.Load() {
-		return nil, driver.ErrBadConn
+		return nil, mc.closedConnectionError()
 	}
 
 	if err := mc.watchCancel(ctx); err != nil {
@@ -700,6 +765,9 @@ func (stmt *mysqlStmt) QueryContext(ctx context.Context, args []driver.NamedValu
 	if err != nil {
 		return nil, err
 	}
+	if stmt == nil || stmt.mc == nil || stmt.mc.closed.Load() {
+		return nil, errStmtClosed(stmt)
+	}
 
 	if err := stmt.mc.watchCancel(ctx); err != nil {
 		return nil, err
@@ -718,6 +786,9 @@ func (stmt *mysqlStmt) ExecContext(ctx context.Context, args []driver.NamedValue
 	dargs, err := namedValueToValue(args)
 	if err != nil {
 		return nil, err
+	}
+	if stmt == nil || stmt.mc == nil || stmt.mc.closed.Load() {
+		return nil, errStmtClosed(stmt)
 	}
 
 	if err := stmt.mc.watchCancel(ctx); err != nil {
@@ -743,9 +814,13 @@ func (mc *mysqlConn) watchCancel(ctx context.Context) error {
 	if ctx.Done() == nil {
 		return nil
 	}
-	// When watcher is not alive, can't watch it.
+	// When watcher is not alive, can't watch it. Start it for directly
+	// constructed connections that have the required close channel.
 	if mc.watcher == nil {
-		return nil
+		if mc.closech == nil {
+			mc.closech = make(chan struct{})
+		}
+		mc.startWatcher()
 	}
 
 	mc.watching = true
@@ -789,30 +864,37 @@ func (mc *mysqlConn) ResetSession(ctx context.Context) error {
 	if mc.closed.Load() || mc.buf.busy() {
 		return driver.ErrBadConn
 	}
+	if mc.netConn == nil && mc.rawConn == nil {
+		return driver.ErrBadConn
+	}
 
-	// Perform a stale connection check. We only perform this check for
-	// the first query on a connection that has been checked out of the
-	// connection pool: a fresh connection from the pool is more likely
-	// to be stale, and it has not performed any previous writes that
-	// could cause data corruption, so it's safe to return ErrBadConn
-	// if the check fails.
-	if mc.cfg.CheckConnLiveness {
+	checkLiveness := mc.cfg == nil || mc.cfg.CheckConnLiveness
+	if checkLiveness {
 		conn := mc.netConn
 		if mc.rawConn != nil {
 			conn = mc.rawConn
 		}
+		var readTimeout time.Duration
+		if mc.cfg != nil {
+			readTimeout = mc.cfg.ReadTimeout
+		}
 		var err error
-		if mc.cfg.ReadTimeout != 0 {
-			err = conn.SetReadDeadline(time.Now().Add(mc.cfg.ReadTimeout))
+		if readTimeout > 0 {
+			err = conn.SetReadDeadline(time.Now().Add(readTimeout))
 		}
 		if err == nil {
 			err = connCheck(conn)
 		}
 		if err != nil {
 			if err == errUnexpectedRead {
+				// idleError closes the connection after recovering a pending
+				// server ERR packet when possible.
 				err = mc.idleError()
 			}
 			mc.log("closing bad idle connection: ", err)
+			// database/sql treats driver.ErrBadConn as permission to discard
+			// this connection and dial a replacement. Do not close the socket
+			// here: diagnostics and platform checks may still need its buffer.
 			return driver.ErrBadConn
 		}
 	}
